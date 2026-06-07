@@ -1,0 +1,134 @@
+what is docker?
+Docker is a set of platform as a service (PaaS) products that use OS-level virtualization to deliver software in packages called containers.
+Docker is a software platform for building application based on containers--small and lightweight execution environments that make shared use of the operating system kernel but otherwise run in isolation from one another.
+
+Docker 
+- Virtualizes application layer 
+- Runs as another application on OS
+- A app of any OS cannot run on any OS 
+- Docker Toolbox
+Application --> OS Kernel --> Hardware
+
+Virtual Machines 
+- Virtualizes OS layer
+- Runs as a machine
+- A VM of any OS can  
+- Virtual Box
+Application --> OS Kernel --> Hardware
+
+what is a container?
+Container is a way to package application with all the necessary dependencies and configuration.
+- This package is portable and can be easily shared around.
+- They are layers of images stacked on top of each other
+- The base OS image would be very small in size (alpine Linux)
+- on top of it we will have application image (configuration data)
+
+what is a Docker Image?
+- A Docker image is a read-only template that contains a set of instructions for creating a container that can run on the Docker platform.
+- it provides a convenient way to package up applications and preconfigured server environments, which you can use for your own private use or share publicly with other Docker users.
+
+docker hub --> docker --> images 
+Thin Writable layer 
+
+Docker operations 
+
+docker --version --> to check the version 
+docker login  --> asks for username and password 
+docker search --> eg: docker search ngnix 
+docker pull  --> docker pull ngnix 
+docker inspect --> to get the more image details (docker inspect image ngnix)
+
+docker images - images 
+docker images ls --> list of images 
+docker ps --> will show the running state containers 
+docker ps -a --> will show stopped containers also 
+
+docker create --> to create a container using image (docker create ngnix)
+docker start --> to start a created container (docker start <container_id or name>) 
+docker stop --> will stop the container (docker stop <container_id or name>) gracefully shutdown 
+docker run --> will create container and start ( docker run --name ngnix_test ngnix) (this will keep running if want to quit we have to pass keyboard arguments open a new terminal and and stop the container)
+
+docker run -d --name ngnix_test ngnix --> detached mode (container will start and come out)
+
+docker create --name test1 ngnix --> custom name 
+
+docker kill --> if a container goes unresponsive or hang (docker kill ngnix_test) will forcefully shutdown 
+docker exec --> docker exec -it nginx_test /bin/bash (execution interactive terminal)
+
+docker rm --> docker rm ngnix_test (always first stop the container and then remove it)
+docker rmi --> docker rmi ngnix (to remove image, reference images should also gets deleted)
+
+Docker Networking 
+Bridge 
+The bridge driver creates an internal network within a single Docker host. containers placed within this network can communicate with each other but are isolated from containers, not on the internal network. bridge is the default driver when running single containers or when using docker-compose.
+Host 
+when using the host driver, the container shares the network stack of the Docker host-appearing as if the container is the host itself, from a networking perspective.
+None 
+The none driver simply disables networking for a container, making it isolated from other containers.
+
+docker network ls --> to see the network in the docker 
+docker run -d --name httpd01  -p 8080:80 httpd 
+docker run -d --name http02 --net host httpd 
+docker run -d --name http03  --net none https ( none will not communicate internally or externally)
+
+Docker Volumes 
+docker volumes ls --> to see the volumes 
+docker volume inspect <volume_name> --> to see the detailed information 
+default location for docker volumes 
+cd /var/lib/docker/volumes/
+
+docker rm $(docker ps -a -q) 
+after deleting the container the volumes will be still present, if we need to delete  docker volume rm <volume_name> 
+
+docker volume prune --> this will remove all local volume not used by at least one container.
+
+docker volume create test_volume --> to create a volume 
+docker volume inspect test_volume 
+
+to mount 
+docker run -it --name=ngnix_test --mount source=test_volume,desrination=/data centos 
+
+ls
+cd data 
+touch testfile.txt
+echo "test data" >> testfile.txt
+cat testfile.txt
+exit 
+docker ps -a --> container will be exited 
+
+cd /var/lib/docker/volumes/test_volume/_data
+ls --> testfile.txt
+cat testfile.txt --> test data 
+
+even if we remove container the volume is still present 
+using the same volume we can create the new container -->   docker run -it --name=ngnix_test2 --mount source=test_volume,desrination=/data centos
+
+To share the volume to the another container 
+docker run -it --volumes from ngnix_test2 --name ngnix_test3 centos /bin/bash
+
+3 ways to mount a volume
+
+
+what is docker file?
+Dockerfile
+
+FROM --> defines the base image used to start the build process.
+ADD --> copies the files from a source on the host into the container's own filesystem at the set destination.
+COPY --> copies the files from a source on the host into the container's own filesystem at the set destination.
+CMD --> can be used for executing a specific command within the container.
+ENTRYPOINT --> sets a default application to be used every time a container is created with the image.
+ENV --> sets environment variables.
+
+EXPOSE --> associate a specific port to enable networking between the container and to the outside.
+MAINTAINER --> defines a full name and email address of the image creator.
+RUN --> is the central executing directive for Dockerfiles.
+USER --> sets the UID (or username) which is to run the container.
+VOLUME --> is used to enable access from the container to a directory on the host machine.
+WORKDIR --> sets the path where the command, defined with CMD, is to be executes.
+LABEL --> allows you to add a label to your docker image.
+
+Multi container App Using Docker
+
+
+
+
