@@ -1,0 +1,245 @@
+Docker Networking — Bridge, Host, None
+Network Types at a Glance
+Driver	Isolation	Use Case
+bridge	Container ↔ Container via virtual switch	Default; microservices on same host
+host	No isolation — shares host network stack	High-performance, low-latency workloads
+none	Completely isolated, no network	Security sandboxing, batch jobs
+overlay	Multi-host (Swarm/K8s)	Distributed systems
+macvlan	Container gets its own MAC/IP	Legacy apps needing direct LAN access
+
+Step-by-Step Hands-On Practice
+Step 1 — Inspect Default Networks
+# See all networks Docker creates by default
+docker network ls
+
+# Inspect the default bridge network
+docker network inspect bridge
+
+# Notice: "Subnet", "Gateway", connected containers
+
+Step 2 — Understand the Default Bridge (and its limits)
+
+# Start two containers on the default bridge
+docker run -d --name app1 alpine sleep 3600
+docker run -d --name app2 alpine sleep 3600
+
+# Try to ping by NAME — this will FAIL on default bridge
+docker exec app1 ping -c 2 app2
+# ping: bad address 'app2'  ← no DNS on default bridge!
+
+# But ping by IP works
+APP2_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' app2)
+docker exec app1 ping -c 2 $APP2_IP
+
+# Cleanup
+docker rm -f app1 app2
+Key insight: Default bridge has no automatic DNS. Custom bridges do.
+
+Step 3 — Create a Custom Bridge Network
+# Create a custom bridge with explicit subnet
+docker network create \
+  --driver bridge \
+  --subnet 192.168.100.0/24 \
+  --gateway 192.168.100.1 \
+  --opt com.docker.network.bridge.name=custom-br0 \
+  my-app-network
+
+# Verify
+docker network inspect my-app-network
+
+Step 4 — Connect Two Containers on Custom Network
+# Start a backend (simulated with nginx)
+docker run -d \
+  --name backend \
+  --network my-app-network \
+  nginx:alpine
+
+# Start a frontend that talks to backend
+docker run -d \
+  --name frontend \
+  --network my-app-network \
+  alpine sleep 3600
+
+# Ping backend BY NAME — works because custom bridge has built-in DNS
+docker exec frontend ping -c 3 backend
+
+# Make an HTTP request from frontend to backend by name
+docker exec frontend wget -qO- http://backend
+# Returns nginx welcome page HTML ✓
+
+Step 5 — Run a Real Two-Container App (App + DB)
+# Create isolated network for this app
+docker network create todo-net
+
+# Start PostgreSQL
+docker run -d \
+  --name todo-db \
+  --network todo-net \
+  --env POSTGRES_PASSWORD=secret \
+  --env POSTGRES_DB=todos \
+  postgres:16-alpine
+
+# Start a client that connects to DB by service name
+docker run -it --rm \
+  --network todo-net \
+  postgres:16-alpine \
+  psql -h todo-db -U postgres -d todos -c "\l"
+# Lists databases — connected using hostname 'todo-db' ✓
+
+Step 6 — Connect a Container to Multiple Networks]
+docker network create frontend-net
+docker network create backend-net
+
+# DB only on backend-net (not exposed to frontend)
+docker run -d --name db --network backend-net postgres:16-alpine
+
+# API on both networks (acts as a bridge between tiers)
+docker run -d --name api --network backend-net nginx:alpine
+docker network connect frontend-net api
+
+# Verify api has two IPs
+docker inspect api --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}: {{$v.IPAddress}}{{"\n"}}{{end}}'
+
+# Cleanup
+docker rm -f db api
+docker network rm frontend-net backend-net
+
+Step 7 — Host Network (Linux only)
+# Container shares host's network stack directly
+docker run -d --name host-nginx --network host nginx:alpine
+
+# nginx now listens on HOST port 80 — no -p mapping needed!
+curl http://localhost:80
+
+# Verify: container has no isolated IP
+docker inspect host-nginx --format '{{.NetworkSettings.IPAddress}}'
+# Returns empty — it IS the host
+
+docker rm -f host-nginx
+
+Step 8 — None Network (Complete Isolation)
+# No network interface except loopback
+docker run -it --rm --network none alpine sh
+
+# Inside container:
+ip addr          # only 'lo' (loopback)
+ping 8.8.8.8     # fails
+wget google.com  # fails
+exit
+
+Step 9 — Disconnect & Clean Up Networks
+# Disconnect a running container from a network
+docker network disconnect my-app-network frontend
+
+# Remove unused networks
+docker network rm my-app-network todo-net
+
+# Remove ALL unused networks at once
+docker network prune -f
+
+Step 10 — Docker Compose with Custom Networks (real-world pattern)
+docker-compose.yml:
+version: "3.9"
+
+services:
+  frontend:
+    image: nginx:alpine
+    networks:
+      - public-net
+
+  api:
+    image: node:20-alpine
+    command: sh -c "npx serve -l 3000"
+    networks:
+      - public-net    # reachable by frontend
+      - private-net   # reachable by db
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+    networks:
+      - private-net   # ONLY api can reach db, not frontend
+
+networks:
+  public-net:
+    driver: bridge
+  private-net:
+    driver: bridge
+    internal: true    # no external internet access
+
+docker compose up -d
+docker compose exec frontend ping api    # ✓
+docker compose exec frontend ping db     # ✗ — network isolation working
+docker compose down
+
+Interview Questions & Answers
+Conceptual
+Q1: What is the default network driver in Docker?
+
+bridge. Every container not explicitly assigned a network joins the default bridge network.
+
+Q2: What's the difference between default bridge and a user-defined bridge?
+
+User-defined bridges provide automatic DNS resolution by container name. Default bridge only allows communication by IP. User-defined bridges also provide better network isolation.
+
+Q3: When would you use --network host?
+
+When you need maximum network performance (no NAT overhead), such as monitoring agents (prometheus, node-exporter), or when the app needs to bind to a specific host port without port mapping. Only works on Linux.
+
+Q4: What does internal: true do in a Compose network?
+
+Blocks all external (outbound internet) traffic on that network. Containers can still talk to each other but cannot reach the internet — useful for databases and internal services.
+
+Q5: Can a container be on multiple networks simultaneously?
+
+Yes. Use docker network connect <network> <container> at runtime or define multiple entries under networks: in Compose. The container gets a separate IP per network.
+
+Practical / Scenario-Based
+Q6: Two containers can't talk to each other by name. How do you debug?
+
+Check they're on the same user-defined network (docker inspect) — default bridge has no DNS
+Verify with docker exec <c1> ping <c2-name>
+Check if a firewall or iptables rule is blocking
+Use docker network inspect <network> to confirm both containers are listed as members
+Q7: A container needs to access the host machine's service (e.g., a DB on the host). How?
+
+Use the special hostname host.docker.internal (Docker Desktop) or 172.17.0.1 (the host's docker0 bridge IP on Linux). Or use --network host if on Linux.
+
+Q8: How do you expose a service only to other containers, not to the host?
+
+Use expose (not ports) in Compose — it makes the port available on the container network but doesn't bind to the host. Or use an internal: true network.
+
+Q9: What happens to containers when you delete a custom network?
+
+Docker refuses to delete a network that has active endpoints (running containers connected to it). You must disconnect or stop containers first.
+
+Q10: How does Docker implement bridge networking under the hood?
+
+Docker creates a virtual bridge (docker0 or custom br-xxxx) in the Linux kernel. Each container gets a veth (virtual ethernet) pair — one end inside the container (eth0), one end attached to the bridge. iptables rules handle NAT for outbound traffic.
+
+Security-Focused
+Q11: Why should microservices use separate networks instead of one shared network?
+
+Principle of least privilege. If one container is compromised, it can only reach containers on the same network. A frontend container should never be able to directly connect to a database.
+
+Q12: Can containers on different networks communicate?
+
+Not by default. A container would need to be explicitly connected to both networks (acting as a router), or traffic must go through a container that bridges both.
+
+Q13: What are the security risks of --network host?
+
+The container can bind to any host port, potentially conflicting with or intercepting host services. It bypasses Docker's network isolation entirely. Avoid in production unless absolutely necessary.
+
+Quick Reference Cheatsheet
+Task	Command
+List networks	docker network ls
+Create custom bridge	docker network create --driver bridge mynet
+Run on specific network	docker run --network mynet ...
+Connect running container	docker network connect mynet container
+Disconnect container	docker network disconnect mynet container
+Inspect network	docker network inspect mynet
+Remove network	docker network rm mynet
+Remove unused networks	docker network prune
+Get container IP	docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' c1
+
