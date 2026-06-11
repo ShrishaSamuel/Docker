@@ -1,0 +1,175 @@
+Docker Images, Docker Hub, Pull/Push
+What is a Docker Image?
+An image is a read-only, layered template built from a Dockerfile. Each instruction adds a layer. Layers are cached and shared across images — saving disk space.
+
+FROM ubuntu          ← Layer 1 (base OS)
+RUN apt-get update   ← Layer 2
+RUN apt-get install  ← Layer 3
+COPY app.py /app     ← Layer 4
+CMD ["python","app"] ← Layer 5 (metadata)
+
+What is Docker Hub?
+The default public image registry at hub.docker.com.
+
+Official images: nginx, ubuntu, python, mysql — maintained by Docker/vendors
+User images: username/repo:tag
+Private registries: AWS ECR, GCP Artifact Registry, self-hosted
+
+Hands-On Step by Step
+Step 1 — Search Images on Hub
+# Search from CLI
+docker search nginx
+docker search ubuntu
+
+# Output shows: NAME, DESCRIPTION, STARS, OFFICIAL
+
+Step 2 — Pull Images
+# Pull latest nginx
+docker pull nginx
+
+# Pull specific tag
+docker pull nginx:1.25
+docker pull nginx:alpine        # smaller image
+
+# Pull ubuntu
+docker pull ubuntu
+docker pull ubuntu:22.04
+docker pull ubuntu:20.04
+
+# Check what you pulled
+docker images
+
+Sample output:
+REPOSITORY   TAG       IMAGE ID       CREATED        SIZE
+nginx        latest    a72860cb95fd   2 weeks ago    192MB
+nginx        alpine    1ae23480369f   2 weeks ago    43.2MB
+ubuntu       latest    35a88802559d   4 weeks ago    78.1MB
+ubuntu       22.04     35a88802559d   4 weeks ago    78.1MB
+
+Step 3 — Inspect an Image
+docker inspect nginx            # full JSON metadata
+docker history nginx            # see all layers + sizes
+docker image ls --digests       # show SHA256 digest
+
+Step 4 — Run nginx & exec into it
+# Run nginx detached, port mapped
+docker run -d --name mynginx -p 8080:80 nginx
+
+# Verify it's running
+docker ps
+curl http://localhost:8080      # see nginx default page
+
+# Exec into the running container
+docker exec -it mynginx bash
+
+# Inside the container — explore
+nginx -v                        # nginx version
+cat /etc/nginx/nginx.conf       # config file
+ls /usr/share/nginx/html/       # default web root
+cat /etc/os-release             # which OS the image is based on
+exit
+
+Step 5 — Run ubuntu & exec into it
+# Run ubuntu interactively
+docker run -it --name myubuntu ubuntu bash
+
+# Inside the container
+whoami                          # root
+hostname                        # container ID
+uname -a                        # kernel (same as host!)
+apt list --installed 2>/dev/null | head -20
+cat /etc/os-release
+pwd
+exit
+
+# Start stopped container again
+docker start myubuntu
+docker exec -it myubuntu bash
+
+Step 6 — Push to Docker Hub
+# Login
+docker login                    # prompts username + password
+
+# Tag your image for push
+docker tag myapp:v1 yourusername/myapp:v1
+
+# Push
+docker push yourusername/myapp:v1
+
+# Pull it back on any machine
+docker pull yourusername/myapp:v1
+
+Step 7 — Tag & Manage Images
+# Tag an existing image with a new name/version
+docker tag nginx:latest mynginx:prod
+docker tag nginx:latest mynginx:1.0
+
+docker images                   # see both tags (same IMAGE ID)
+
+# Remove a specific tag
+docker rmi mynginx:1.0
+
+# Remove image by ID (all tags removed)
+docker rmi <image_id>
+
+# Remove all unused images
+docker image prune -a
+
+Step 8 — Alpine vs Full Images
+# Compare sizes
+docker pull nginx:latest
+docker pull nginx:alpine
+
+docker images nginx             # see size difference (~192MB vs ~43MB)
+
+# Alpine is minimal — fewer tools, smaller attack surface
+docker run -it nginx:alpine sh  # uses sh not bash (no bash in alpine)
+
+Interview Questions & Answers
+Q1. What is a Docker image and how is it structured?
+
+A read-only stack of layers, each representing a Dockerfile instruction. Layers are cached and shared. The final layer is a writable container layer added at runtime.
+
+Q2. What is Docker Hub? What are official images?
+
+Docker Hub is the default public registry. Official images are curated, security-scanned images maintained by Docker or the software vendor (e.g., nginx, ubuntu, python).
+
+Q3. What is the difference between docker pull and docker run?
+
+pull only downloads the image. run = pull (if not present) + create container + start it.
+
+Q4. What is an image tag? What is latest?
+
+A tag is a label for a specific version: nginx:1.25, ubuntu:22.04. latest is just a default tag — it does NOT always mean the newest version. Never rely on latest in production.
+
+Q5. What is image digest?
+
+A SHA256 hash of the image content. Immutable identifier — unlike tags which can be reassigned. Use image@sha256:abc... for reproducible pulls.
+
+Q6. Difference between docker exec and docker run?
+
+run creates a new container from an image. exec runs a command inside an already running container.
+
+Q7. What happens to data when a container is removed?
+
+Lost. Container's writable layer is deleted. Use volumes or bind mounts to persist data.
+
+Q8. What is a dangling image?
+
+An image with no tag (<none>:<none>), created when you rebuild with the same tag. Clean with docker image prune.
+
+Q9. How do you reduce image size?
+
+Use Alpine base images, multi-stage builds, combine RUN commands, use .dockerignore, remove cache (apt-get clean).
+
+Q10. How do you check image layers?
+
+docker history image_name — shows each layer, the command that created it, and its size.
+
+Q11. What is a private registry?
+
+A self-hosted or cloud registry (AWS ECR, GCP Artifact Registry, Harbor) to store images privately instead of Docker Hub.
+
+Q12. How do you tag an image before pushing?
+
+docker tag source_image:tag registry/username/repo:tag — then docker push.
