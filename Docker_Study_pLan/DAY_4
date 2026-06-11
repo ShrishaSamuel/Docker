@@ -1,0 +1,283 @@
+Dockerfile Best Practices — Layers, Caching, .dockerignore
+How Layers Work
+Every RUN, COPY, ADD instruction creates a new layer. Layers are:
+
+Cached — reused if nothing above changed
+Stacked — each layer adds to the image size
+Immutable — even if you delete a file in a later layer, it still exists in the earlier layer (size not reduced)
+
+FROM ubuntu              ← Layer 1: 78MB
+RUN apt-get update       ← Layer 2: +32MB
+RUN apt-get install -y curl  ← Layer 3: +12MB
+COPY app.py /app/        ← Layer 4: +1KB
+
+Hands-On: Start with a BAD Dockerfile
+Step 1 — Create a deliberately bad Dockerfile
+mkdir ~/dockerfile-optimize && cd ~/dockerfile-optimize
+
+cat > app.py <<'EOF'
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Optimized Docker App!"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+EOF
+
+cat > requirements.txt <<'EOF'
+flask==3.0.0
+EOF
+
+# BAD Dockerfile — all anti-patterns
+cat > Dockerfile.bad <<'EOF'
+FROM ubuntu
+
+RUN apt-get update
+RUN apt-get install -y python3
+RUN apt-get install -y python3-pip
+RUN apt-get install -y curl wget vim nano git
+
+COPY . /app
+
+RUN pip3 install flask
+
+WORKDIR /app
+
+CMD ["python3", "app.py"]
+EOF
+
+# Build bad version
+docker build -f Dockerfile.bad -t flask-bad:v1 .
+docker images flask-bad        # note the SIZE
+
+Hands-On: Apply Best Practices One by One
+Practice 1 — Use a Specific Slim Base Image
+
+# ubuntu = 78MB base, full OS
+# python:3.11 = 900MB+ (has build tools)
+# python:3.11-slim = 130MB (no extras)
+# python:3.11-alpine = 23MB (musl libc, minimal)
+
+docker pull python:3.11
+docker pull python:3.11-slim
+docker pull python:3.11-alpine
+
+docker images python           # compare sizes side by side
+
+Practice 2 — Combine RUN commands (fewer layers)
+# BAD — 3 separate layers, apt cache left behind
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get install -y wget
+
+# GOOD — 1 layer, cache cleaned in same layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl wget && \
+    rm -rf /var/lib/apt/lists/*
+
+Practice 3 — Order layers by change frequency
+# BAD — any code change re-installs all dependencies
+COPY . /app
+RUN pip install -r /app/requirements.txt
+
+# GOOD — dependencies cached unless requirements.txt changes
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .         ← changes often, stays at bottom
+
+Practice 4 — Create the GOOD Dockerfile
+cat > Dockerfile.good <<'EOF'
+# Best practice 1: specific slim base image
+FROM python:3.11-slim
+
+# Best practice 2: set WORKDIR early
+WORKDIR /app
+
+# Best practice 3: copy dependencies BEFORE source code
+COPY requirements.txt .
+
+# Best practice 4: install with no cache, combine in one RUN
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Best practice 5: copy app source last (changes most often)
+COPY app.py .
+
+# Best practice 6: run as non-root user
+RUN useradd -m appuser
+USER appuser
+
+# Best practice 7: document the port
+EXPOSE 5000
+
+# Best practice 8: use exec form (not shell form)
+CMD ["python", "app.py"]
+EOF
+
+docker build -f Dockerfile.good -t flask-good:v1 .
+docker images | grep flask     # compare bad vs good sizes
+
+Hands-On: .dockerignore Deep Dive
+Step 1 — See what enters build context without .dockerignore
+# Add junk files to simulate a real project
+mkdir -p .git node_modules __pycache__
+echo "SECRET_KEY=abc123" > .env
+dd if=/dev/urandom of=bigfile.bin bs=1M count=10   # 10MB dummy file
+touch test_app.py debug.log
+
+# Build and watch "Sending build context" size
+docker build -f Dockerfile.good -t flask-nignore:v1 .
+# Sending build context to Docker daemon  XX MB  ← watch this
+
+Step 2 — Add .dockerignore
+cat > .dockerignore <<'EOF'
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment & secrets
+.env
+*.env
+
+# Test files
+test_*.py
+*_test.py
+
+# Logs & temp
+*.log
+*.tmp
+bigfile.bin
+
+# Node (if mixed project)
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+EOF
+
+# Rebuild — notice smaller build context
+docker build -f Dockerfile.good -t flask-withignore:v1 .
+# Sending build context to Docker daemon  X KB  ← much smaller
+
+Hands-On: Multi-Stage Build to Minimize Size
+cat > Dockerfile.multistage <<'EOF'
+# ---- Stage 1: Builder ----
+FROM python:3.11 AS builder
+WORKDIR /build
+
+COPY requirements.txt .
+# Install to a local dir, not system
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---- Stage 2: Runtime ----
+FROM python:3.11-slim AS runtime
+WORKDIR /app
+
+# Copy only installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy app
+COPY app.py .
+
+RUN useradd -m appuser
+USER appuser
+
+EXPOSE 5000
+CMD ["python", "app.py"]
+EOF
+
+docker build -f Dockerfile.multistage -t flask-multistage:v1 .
+
+# Compare all versions
+docker images | grep flask
+# flask-bad         →  huge
+# flask-good        →  medium
+# flask-multistage  →  smallest
+
+Hands-On: Verify Caching in Action
+# Build once
+docker build -f Dockerfile.good -t flask-cache:v1 .
+
+# Change only app.py
+echo "# new comment" >> app.py
+
+# Rebuild — watch which steps say CACHED
+docker build -f Dockerfile.good -t flask-cache:v2 .
+# Step 1: FROM       → CACHED
+# Step 2: WORKDIR    → CACHED
+# Step 3: COPY req   → CACHED
+# Step 4: RUN pip    → CACHED  ← key! no reinstall
+# Step 5: COPY app   → not cached (file changed)
+
+# Now change requirements.txt
+echo "requests==2.31.0" >> requirements.txt
+
+# Rebuild — pip install is no longer cached
+docker build -f Dockerfile.good -t flask-cache:v3 .
+# Step 4: RUN pip    → not cached (runs again)
+
+Summary: Cheat Sheet
+BAD                              GOOD
+─────────────────────────────────────────────────────
+FROM ubuntu                      FROM python:3.11-slim
+RUN apt update                   RUN apt update && apt install -y pkg \
+RUN apt install -y pkg               && rm -rf /var/lib/apt/lists/*
+COPY . /app                      COPY requirements.txt .
+RUN pip install -r req.txt       RUN pip install --no-cache-dir -r req.txt
+                                 COPY app.py .
+No .dockerignore                 .dockerignore excludes .git, __pycache__, .env
+No non-root user                 RUN useradd -m user && USER user
+CMD python app.py (shell form)   CMD ["python", "app.py"] (exec form)
+Single-stage build               Multi-stage for compiled/heavy apps
+
+Interview Questions & Answers
+Q1. How does Docker layer caching work?
+
+Docker caches each instruction layer. On rebuild, if a layer's instruction AND all inputs (files, args) are unchanged, Docker reuses the cache. Any change invalidates that layer and all layers below it.
+
+Q2. Why should you copy requirements.txt before source code?
+
+Dependencies change rarely; source code changes often. Copying requirements first means the pip install layer is cached unless requirements.txt changes — saving minutes on every rebuild.
+
+Q3. Why can't you reduce image size by deleting files in a later RUN?
+
+Each RUN creates a new layer. The file still exists in the earlier layer and is counted in image size. To truly remove it, delete in the same RUN command that created it.
+
+Q4. What is the difference between shell form and exec form of CMD?
+
+Shell form: CMD python app.py — runs via /bin/sh -c, PID 1 is sh, signals not forwarded to app.
+Exec form: CMD ["python", "app.py"] — app is PID 1, receives OS signals (SIGTERM) directly. Always prefer exec form.
+
+Q5. Why run containers as non-root?
+
+If a container is compromised, a root process can escape and damage the host. Non-root user limits blast radius — follows principle of least privilege.
+
+Q6. What does .dockerignore do and why does it matter?
+
+Excludes files from build context sent to Docker daemon. Smaller context = faster builds. Also prevents secrets (.env) and large files from entering the image accidentally.
+
+Q7. What is a multi-stage build? When would you use it?
+
+Multiple FROM stages — build tools stay in early stages, only the runtime artifact is in the final image. Use for compiled languages (Go, Java, C++), or when build tools (gcc, npm dev deps) shouldn't be in production.
+
+Q8. What does --no-cache-dir do in pip?
+
+Prevents pip from writing downloaded packages to a local cache dir. Since the cache is useless inside an image layer, this saves space.
+
+Q9. What is --no-install-recommends in apt?
+
+Tells apt not to install suggested/recommended packages — only installs exactly what you asked for. Reduces image size significantly.
+
+Q10. How would you find which layer is making your image large?
+
+docker history image_name — shows each layer with its size. Identify the large ones and optimize the corresponding Dockerfile instruction.
