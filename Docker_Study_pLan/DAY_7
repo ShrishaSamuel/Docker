@@ -1,0 +1,336 @@
+Docker Volumes & Bind Mounts
+Storage Types at a Glance
+Type	Managed By	Location on Host	Use Case
+volume	Docker	/var/lib/docker/volumes/	Production data persistence
+bind mount	You	Any path you specify	Dev: live code reload
+tmpfs	Kernel (RAM)	Memory only	Secrets, temp sensitive data
+
+Step-by-Step Hands-On Practice
+Step 1 — Understand the Problem (no persistence)
+# Write data inside a container with NO volume
+docker run --name no-persist alpine sh -c "echo 'important data' > /data/file.txt"
+# Error: /data doesn't exist — let's use /tmp
+docker run --name no-persist alpine sh -c "echo 'important data' > /tmp/file.txt"
+
+# Container stops. Restart it.
+docker start -ai no-persist
+
+# Data is gone after rm
+docker rm no-persist
+docker run --rm alpine sh -c "cat /tmp/file.txt 2>/dev/null || echo 'DATA LOST'"
+
+# Cleanup
+docker rm -f no-persist 2>/dev/null; true
+
+Step 2 — Named Volume (Docker-Managed)
+# Create a named volume explicitly
+docker volume create app-data
+
+# Inspect it — see where Docker stores it on host
+docker volume inspect app-data
+# "Mountpoint": "/var/lib/docker/volumes/app-data/_data"
+
+# List volumes
+docker volume ls
+
+Step 3 — Persist Data Across Container Restarts
+# Run container 1 — WRITE data to the volume
+docker run --rm \
+  --name writer \
+  -v app-data:/data \
+  alpine sh -c "echo 'persisted across restarts' > /data/message.txt && cat /data/message.txt"
+
+# Container is gone (--rm), but volume survives
+# Run container 2 — READ the same volume
+docker run --rm \
+  --name reader \
+  -v app-data:/data \
+  alpine cat /data/message.txt
+
+# Output: "persisted across restarts" ✓
+
+Step 4 — Persist a Database (Real-World Pattern)
+# Create volume for postgres data
+docker volume create pgdata
+
+# Start postgres with volume
+docker run -d \
+  --name mydb \
+  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_DB=myapp \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+# Wait for DB to be ready, then insert data
+sleep 3
+docker exec -it mydb psql -U postgres -d myapp \
+  -c "CREATE TABLE users (id SERIAL, name TEXT); INSERT INTO users(name) VALUES ('Alice'),('Bob');"
+
+# STOP and REMOVE the container completely
+docker rm -f mydb
+
+# Start a BRAND NEW container using the same volume
+docker run -d \
+  --name mydb-new \
+  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_DB=myapp \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+sleep 3
+
+# Query — data is still there!
+docker exec mydb-new psql -U postgres -d myapp -c "SELECT * FROM users;"
+#  id | name
+# ----+-------
+#   1 | Alice
+#   2 | Bob    ✓
+
+docker rm -f mydb-new
+
+Step 5 — Bind Mount (Live Code Reload for Dev)
+mkdir -p ~/demo-app
+echo "<h1>Version 1</h1>" > ~/demo-app/index.html
+
+# Mount local directory into nginx
+docker run -d \
+  --name devserver \
+  -p 8080:80 \
+  -v ~/demo-app:/usr/share/nginx/html:ro \
+  nginx:alpine
+
+curl http://localhost:8080
+# <h1>Version 1</h1>
+
+# Edit on HOST — change reflects immediately, no rebuild!
+echo "<h1>Version 2 — Live Reload!</h1>" > ~/demo-app/index.html
+
+curl http://localhost:8080
+# <h1>Version 2 — Live Reload!</h1>  ✓
+
+docker rm -f devserver
+:ro = read-only inside container. Container cannot write back to your host files.
+
+
+Step 6 — Bind Mount vs Volume Side-by-Side
+# Bind mount — you control the path
+docker run --rm \
+  -v /tmp/mydata:/data \
+  alpine sh -c "echo 'bind mount' > /data/test.txt && cat /data/test.txt"
+
+cat /tmp/mydata/test.txt   # readable directly on host ✓
+
+# Named volume — Docker controls the path
+docker run --rm \
+  -v myvolume:/data \
+  alpine sh -c "echo 'named volume' > /data/test.txt && cat /data/test.txt"
+
+# To read it on host (need sudo or docker cp):
+docker run --rm -v myvolume:/data alpine cat /data/test.txt  ✓
+
+# Cleanup
+docker volume rm myvolume
+
+Step 7 — tmpfs Mount (Sensitive Data in RAM)
+# Data written to tmpfs NEVER touches disk
+docker run -it --rm \
+  --tmpfs /secrets:rw,size=64m,mode=1700 \
+  alpine sh -c "
+    echo 'api-key-12345' > /secrets/key.txt
+    cat /secrets/key.txt
+    echo 'This never hits the disk'
+  "
+# When container stops, /secrets is wiped from RAM
+
+Step 8 — Volume Operations (Backup, Restore, Copy)
+# BACKUP a volume to a tar file on host
+docker run --rm \
+  -v app-data:/source:ro \
+  -v $(pwd):/backup \
+  alpine tar czf /backup/app-data-backup.tar.gz -C /source .
+
+ls -lh app-data-backup.tar.gz  # backup file on host ✓
+
+# RESTORE into a new volume
+docker volume create app-data-restored
+docker run --rm \
+  -v app-data-restored:/target \
+  -v $(pwd):/backup \
+  alpine tar xzf /backup/app-data-backup.tar.gz -C /target
+
+# Verify restore
+docker run --rm -v app-data-restored:/data alpine cat /data/message.txt
+
+# Copy a single file out of a volume (no running container needed)
+docker create --name temp-container -v app-data:/data alpine
+docker cp temp-container:/data/message.txt ./recovered-message.txt
+docker rm temp-container
+
+# Cleanup
+docker volume rm app-data app-data-restored
+
+Step 9 — Volume in Docker Compose
+docker-compose.yml:
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # named volume
+
+  api:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./src:/app/src                    # bind mount for live dev
+      - node_modules:/app/node_modules    # volume so host doesn't overwrite
+    command: sh -c "npm install && node src/index.js"
+
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - type: tmpfs                       # tmpfs for ephemeral cache
+        target: /data
+
+volumes:
+  pgdata:         # Docker-managed, persists between `compose down`
+  node_modules:   # Prevents host node_modules from shadowing container's
+
+docker compose up -d
+docker compose down        # volumes SURVIVE
+docker compose down -v     # volumes DELETED (careful!)
+
+Step 10 — Prune and Manage Volumes
+# List all volumes
+docker volume ls
+
+# Show dangling volumes (not attached to any container)
+docker volume ls -f dangling=true
+
+# Remove a specific volume
+docker volume rm pgdata
+
+# Remove ALL unused volumes (dangerous — confirm first)
+docker volume prune -f
+
+Interview Questions & Answers
+Conceptual
+Q1: What is the difference between a volume and a bind mount?
+
+Volume: managed by Docker, stored in /var/lib/docker/volumes/, portable, works on any OS, preferred for production. Bind mount: maps a specific host path into the container, you manage it, ideal for dev (live reload). Volumes are safer — Docker controls them and they're not accidentally deleted by host operations.
+
+Q2: Why use a named volume instead of an anonymous volume?
+
+Named volumes are explicitly referenced by name, easy to reuse across containers, and won't be garbage-collected by docker volume prune as easily as anonymous ones. Anonymous volumes (created by VOLUME in Dockerfile with no name) are harder to track.
+
+Q3: What is tmpfs and when would you use it?
+
+A tmpfs mount stores data in host RAM — never written to disk. Use it for sensitive data (tokens, session keys), cache that should not persist, or performance-critical temp storage.
+
+Q4: What does the VOLUME instruction in a Dockerfile do?
+
+It declares a mount point and creates an anonymous volume at runtime if no -v is specified. It does NOT define what gets mounted — that's the runtime's job. It's a hint that data at that path should be persisted.
+
+Q5: Does docker compose down delete volumes?
+
+No, by default down preserves volumes. Use docker compose down -v or --volumes to also delete the named volumes defined in the Compose file.
+
+Practical / Scenario-Based
+Q6: A developer says "my DB data is lost every time the container restarts." What's wrong?
+
+No volume is mounted. The data lives only in the container's writable layer. Fix: add -v pgdata:/var/lib/postgresql/data. Also verify they're not running docker rm (which removes the container layer) vs just stopping it.
+
+Q7: You need to share a volume between two containers simultaneously. How?
+
+Mount the same named volume in both containers:
+
+docker run -d -v shared-data:/data --name c1 alpine sleep 3600
+docker run -d -v shared-data:/data --name c2 alpine sleep 3600
+
+Both can read/write. Implement file locking in your app to avoid race conditions.
+
+Q8: How do you migrate a volume's data to a new server?
+
+docker run --rm -v oldvolume:/src -v $(pwd):/backup alpine tar czf /backup/vol.tar.gz -C /src .
+Transfer vol.tar.gz to new server (scp/rsync)
+docker volume create newvolume
+docker run --rm -v newvolume:/target -v $(pwd):/backup alpine tar xzf /backup/vol.tar.gz -C /target
+
+Q9: What's the node_modules volume trick in Compose and why is it needed?
+
+When bind-mounting ./src:/app on a host that has no node_modules (or a different OS), the host directory overwrites the container's node_modules. The fix is a separate named volume for node_modules which takes precedence over the bind mount for that specific subdirectory.
+
+Q10: How do you make a bind mount read-only?
+
+Append :ro — -v /host/path:/container/path:ro. The container can read but cannot write back to the host path. Useful for config files and static assets.
+
+Security-Focused
+Q11: What are the security risks of bind mounts?
+
+Mounting / or /etc exposes the entire host filesystem
+A compromised container can modify host files if the mount is writable
+Mounting the Docker socket (/var/run/docker.sock) gives the container full Docker control = root on host
+Always use :ro where writes aren't needed and never mount the Docker socket in production
+Q12: Are volumes encrypted at rest?
+
+Not by default. Docker volumes are plain directories on the host. For encryption, use encrypted host filesystems (LUKS), encrypted storage drivers, or cloud provider volume encryption (EBS, Azure Disk).
+
+Quick Reference Cheatsheet
+Task	Command
+Create named volume	docker volume create mydata
+Mount volume	docker run -v mydata:/app/data image
+Bind mount	docker run -v /host/path:/container/path image
+Read-only mount	docker run -v mydata:/data:ro image
+tmpfs mount	docker run --tmpfs /tmp:size=64m image
+List volumes	docker volume ls
+Inspect volume	docker volume inspect mydata
+Copy from volume	docker cp container:/data/file ./file
+Remove volume	docker volume rm mydata
+Prune unused	docker volume prune
+Compose — keep volumes	docker compose down
+Compose — delete volumes	docker compose down -v
+docker run -d -v shared-data:/data --name c2 alpine sleep 3600
+Both can read/write. Implement file locking in your app to avoid race conditions.
+
+Q8: How do you migrate a volume's data to a new server?
+
+docker run --rm -v oldvolume:/src -v $(pwd):/backup alpine tar czf /backup/vol.tar.gz -C /src .
+Transfer vol.tar.gz to new server (scp/rsync)
+docker volume create newvolume
+docker run --rm -v newvolume:/target -v $(pwd):/backup alpine tar xzf /backup/vol.tar.gz -C /target
+Q9: What's the node_modules volume trick in Compose and why is it needed?
+
+When bind-mounting ./src:/app on a host that has no node_modules (or a different OS), the host directory overwrites the container's node_modules. The fix is a separate named volume for node_modules which takes precedence over the bind mount for that specific subdirectory.
+
+Q10: How do you make a bind mount read-only?
+
+Append :ro — -v /host/path:/container/path:ro. The container can read but cannot write back to the host path. Useful for config files and static assets.
+
+Security-Focused
+Q11: What are the security risks of bind mounts?
+
+Mounting / or /etc exposes the entire host filesystem
+A compromised container can modify host files if the mount is writable
+Mounting the Docker socket (/var/run/docker.sock) gives the container full Docker control = root on host
+Always use :ro where writes aren't needed and never mount the Docker socket in production
+Q12: Are volumes encrypted at rest?
+
+Not by default. Docker volumes are plain directories on the host. For encryption, use encrypted host filesystems (LUKS), encrypted storage drivers, or cloud provider volume encryption (EBS, Azure Disk).
+
+Quick Reference Cheatsheet
+Task	Command
+Create named volume	docker volume create mydata
+Mount volume	docker run -v mydata:/app/data image
+Bind mount	docker run -v /host/path:/container/path image
+Read-only mount	docker run -v mydata:/data:ro image
+tmpfs mount	docker run --tmpfs /tmp:size=64m image
+List volumes	docker volume ls
+Inspect volume	docker volume inspect mydata
+Copy from volume	docker cp container:/data/file ./file
+Remove volume	docker volume rm mydata
+Prune unused	docker volume prune
+Compose — keep volumes	docker compose down
+Compose — delete volumes	docker compose down -v
