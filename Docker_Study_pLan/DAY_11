@@ -1,0 +1,246 @@
+CMD vs ENTRYPOINT, ARG vs ENV
+Part 1 — CMD vs ENTRYPOINT
+The Core Difference
+
+ENTRYPOINT = the executable that ALWAYS runs (cannot be overridden easily)
+CMD        = default arguments passed to ENTRYPOINT (easily overridden at runtime)
+
+Step 1 — CMD alone
+# Dockerfile.cmd
+FROM alpine
+CMD ["echo", "hello from CMD"]
+
+docker build -f Dockerfile.cmd -t test-cmd .
+
+# Uses CMD as default
+docker run --rm test-cmd
+# hello from CMD
+
+# CMD is REPLACED entirely when you pass args
+docker run --rm test-cmd echo "overridden"
+# overridden
+
+docker run --rm test-cmd ls /
+# bin  dev  etc  home ...   ← CMD completely replaced
+
+Step 2 — ENTRYPOINT alone
+# Dockerfile.ep
+FROM alpine
+ENTRYPOINT ["echo"]
+
+docker build -f Dockerfile.ep -t test-ep .
+
+# Runs echo with no args
+docker run --rm test-ep
+# (blank line)
+
+# Args APPEND to ENTRYPOINT
+docker run --rm test-ep "hello world"
+# hello world
+
+docker run --rm test-ep foo bar baz
+# foo bar baz
+
+Step 3 — ENTRYPOINT + CMD together (the correct pattern)
+# Dockerfile.both
+FROM alpine
+ENTRYPOINT ["echo"]
+CMD ["default message"]
+
+docker build -f Dockerfile.both -t test-both .
+
+# No args → uses CMD as default argument to ENTRYPOINT
+docker run --rm test-both
+# default message
+
+# Override CMD only → ENTRYPOINT stays
+docker run --rm test-both "custom message"
+# custom message
+
+# Override ENTRYPOINT entirely → use --entrypoint flag
+docker run --rm --entrypoint ls test-both /etc
+# hostname  hosts  passwd ...
+
+Step 4 — Real-world pattern: script as ENTRYPOINT
+# Dockerfile.real
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY app.py .
+
+ENTRYPOINT ["python", "app.py"]
+CMD ["--env", "production"]    # default args
+
+# Production (uses CMD defaults)
+docker run --rm test-real
+# Running with --env production
+
+# Override for dev
+docker run --rm test-real --env development --debug
+# Running with --env development --debug
+
+# Override for testing
+docker run --rm test-real --help
+# Shows app help
+
+Step 5 — Shell form vs Exec form (important!)
+# SHELL form — runs via /bin/sh -c (BAD for signal handling)
+CMD echo "hello"
+ENTRYPOINT python app.py
+
+# EXEC form — runs directly, PID 1, receives signals properly (GOOD)
+CMD ["echo", "hello"]
+ENTRYPOINT ["python", "app.py"]
+
+# Prove the difference — check PID 1
+docker run --rm test-shell ps aux
+# PID 1 = /bin/sh -c python app.py  ← sh is PID 1, not your app
+# SIGTERM goes to sh, NOT your app → graceful shutdown broken
+
+docker run --rm test-exec ps aux
+# PID 1 = python app.py  ← your app IS PID 1
+# SIGTERM handled correctly → graceful shutdown works
+
+Part 2 — ARG vs ENV
+The Core Difference
+ARG = build-time only — available during docker build, gone at runtime
+ENV = runtime — available during build AND when container runs
+
+Step 6 — ARG basics
+# Dockerfile.arg
+FROM alpine
+
+ARG APP_VERSION=1.0.0        # default value
+ARG BUILD_DATE
+
+RUN echo "Building version $APP_VERSION on $BUILD_DATE"
+
+CMD ["sh", "-c", "echo version is $APP_VERSION"]
+
+docker build -f Dockerfile.arg -t test-arg .
+# Building version 1.0.0 on    ← BUILD_DATE is empty (no default)
+
+# Override ARG at build time
+docker build -f Dockerfile.arg \
+  --build-arg APP_VERSION=2.5.0 \
+  --build-arg BUILD_DATE=$(date +%Y-%m-%d) \
+  -t test-arg:2.5.0 .
+# Building version 2.5.0 on 2026-06-11
+
+# ARG is GONE at runtime
+docker run --rm test-arg:2.5.0
+# version is     ← empty! ARG doesn't exist at runtime
+
+Step 7 — ENV basics
+# Dockerfile.env
+FROM alpine
+
+ENV APP_ENV=production
+ENV LOG_LEVEL=info
+ENV DB_HOST=localhost DB_PORT=5432   # multiple on one line
+
+CMD ["sh", "-c", "echo env=$APP_ENV log=$LOG_LEVEL db=$DB_HOST:$DB_PORT"]
+
+docker build -f Dockerfile.env -t test-env .
+
+# Uses Dockerfile defaults
+docker run --rm test-env
+# env=production log=info db=localhost:5432
+
+# Override ENV at runtime with -e
+docker run --rm -e APP_ENV=staging -e LOG_LEVEL=debug test-env
+# env=staging log=debug db=localhost:5432
+
+# Override with env file
+cat > .env.local << EOF
+APP_ENV=development
+LOG_LEVEL=trace
+DB_HOST=mydb.internal
+EOF
+docker run --rm --env-file .env.local test-env
+# env=development log=trace db=mydb.internal:5432
+
+Step 8 — ARG into ENV (the bridge pattern)
+# Dockerfile.argenv
+FROM alpine
+
+# ARG for build-time value
+ARG APP_VERSION=1.0.0
+
+# Promote ARG → ENV so it's available at runtime too
+ENV APP_VERSION=$APP_VERSION
+
+CMD ["sh", "-c", "echo running version $APP_VERSION"]
+
+# Build with custom version
+docker build -f Dockerfile.argenv \
+  --build-arg APP_VERSION=3.1.0 \
+  -t myapp:3.1.0 .
+
+# Now available at runtime
+docker run --rm myapp:3.1.0
+# running version 3.1.0
+
+# Inspect it
+docker inspect myapp:3.1.0 | grep APP_VERSION
+# "APP_VERSION=3.1.0"
+
+Step 9 — ARG scope (position matters)
+FROM alpine
+
+ARG MY_VAR=before   # available from here
+
+RUN echo "before FROM: $MY_VAR"
+
+FROM alpine         # second FROM resets ARG scope!
+
+RUN echo "after second FROM: $MY_VAR"   # empty!
+
+ARG MY_VAR          # must re-declare after each FROM
+RUN echo "re-declared: $MY_VAR"         # works now
+
+Step 10 — All 4 combinations tested
+FROM alpine
+
+ARG  BUILD_ONLY=build_value       # build only
+ENV  RUNTIME_ONLY=runtime_value   # runtime only
+ARG  PROMOTED=arg_val
+ENV  PROMOTED=$PROMOTED           # both (arg promoted to env)
+
+docker build -t test-all .
+
+# At runtime:
+docker run --rm test-all env
+# RUNTIME_ONLY=runtime_value   ✓
+# PROMOTED=arg_val              ✓ (promoted)
+# BUILD_ONLY not shown          ✓ (gone at runtime)
+
+All Interview Questions
+CMD vs ENTRYPOINT
+Question	Answer
+What is the difference between CMD and ENTRYPOINT?	ENTRYPOINT is the fixed executable; CMD provides default args. CMD is easily overridden; ENTRYPOINT requires --entrypoint flag
+What happens when you combine both?	ENTRYPOINT runs always; CMD is passed as default args. Runtime args replace CMD but not ENTRYPOINT
+What is exec form vs shell form?	Exec form ["cmd"] runs directly as PID 1, receives signals. Shell form cmd runs via /bin/sh -c, your app is NOT PID 1
+Why does shell form break graceful shutdown?	SIGTERM goes to sh (PID 1), not your app — app never gets the signal to shut down cleanly
+How do you override ENTRYPOINT at runtime?	docker run --entrypoint <new-cmd> <image>
+If only CMD is set, what runs?	CMD itself is treated as the full command
+Can you have multiple CMD instructions?	Yes, but only the last one takes effect
+
+ARG vs ENV
+Question	Answer
+What is the difference between ARG and ENV?	ARG is build-time only; ENV persists into the running container
+Can ARG be used at runtime?	No — it's gone after the build layer that uses it
+How do you make a build-time value available at runtime?	ARG VERSION=1.0 then ENV VERSION=$VERSION — promotes ARG to ENV
+Is ENV visible in docker inspect?	Yes — docker inspect shows all ENV values. Never put secrets in ENV
+What is the default value syntax for ARG?	ARG NAME=default_value
+Does ARG reset after a new FROM in multi-stage?	Yes — must re-declare ARG after each FROM
+How do you pass ARG at build time?	docker build --build-arg KEY=value .
+Where are ENV variables visible?	In the running container, docker inspect, and all child processes
+
+Combined / Advanced
+Question	Answer
+Which is better for secrets: ARG or ENV?	Neither — ARG is in build layer history, ENV is in docker inspect. Use BuildKit --mount=type=secret
+Can you override ENV at runtime?	Yes — docker run -e KEY=value or --env-file
+What is the order of precedence for ENV?	--env-file < -e at runtime (runtime -e wins)
+What does CMD ["sh", "-c", "echo $HOME"] do vs CMD ["echo", "$HOME"]?	First: shell expands $HOME ✓. Second: exec form, no shell, $HOME is literal string ✗
+A container ignores docker stop and takes 10 seconds to stop — why?	Shell form ENTRYPOINT — sh is PID 1, SIGTERM goes to sh not the app, Docker waits 10s then sends SIGKILL
