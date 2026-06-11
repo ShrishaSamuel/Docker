@@ -1,0 +1,263 @@
+Docker Revision + 20 Interview Questions
+
+Quick Revision — Core Concepts
+1. Docker Architecture
+
+Developer CLI
+     │
+     ▼
+Docker Daemon (dockerd)      ← manages everything
+     │
+     ├─── Images             ← read-only templates (layers)
+     ├─── Containers         ← running instances of images
+     ├─── Volumes            ← persistent storage
+     └─── Networks           ← container communication
+
+Container Registry (Docker Hub / Artifactory)
+     │
+     └─── push/pull images
+
+2. Image Layers
+FROM ubuntu:22.04         ← Layer 1 (base, ~77MB)
+RUN apt-get install python ← Layer 2 (added packages)
+COPY app.py /app/          ← Layer 3 (your code)
+CMD ["python", "/app/app.py"] ← Layer 4 (metadata only)
+
+Each layer is IMMUTABLE and CACHED
+Changing Layer 2 → invalidates Layer 3, 4 (cache busted)
+
+3. Dockerfile Key Instructions
+FROM        # base image
+RUN         # execute command during build (creates layer)
+COPY        # copy files from host into image
+ADD         # like COPY but also handles URLs and tar auto-extract
+ENV         # runtime environment variable
+ARG         # build-time variable only
+EXPOSE      # documents port (does NOT publish it)
+VOLUME      # declares mount point
+WORKDIR     # sets working directory
+USER        # sets runtime user
+CMD         # default command (overridable)
+ENTRYPOINT  # fixed executable (use --entrypoint to override)
+LABEL       # metadata key=value
+HEALTHCHECK # how Docker checks if container is healthy
+
+4. Essential Commands
+# Images
+docker build -t myapp:1.0 .
+docker images
+docker pull nginx:alpine
+docker push myregistry/myapp:1.0
+docker rmi myapp:1.0
+docker image prune -a          # remove all unused images
+
+# Containers
+docker run -d -p 8080:80 --name webserver nginx
+docker ps                      # running
+docker ps -a                   # all including stopped
+docker stop webserver
+docker rm webserver
+docker logs webserver -f       # follow logs
+docker exec -it webserver sh   # shell into running container
+docker inspect webserver       # full metadata JSON
+
+# Volumes
+docker volume create mydata
+docker run -v mydata:/data alpine
+docker volume ls
+docker volume prune
+
+# Networks
+docker network create mynet
+docker run --network mynet alpine
+docker network ls
+docker network inspect mynet
+
+5. Volumes vs Bind Mounts vs tmpfs
+Named Volume          Bind Mount            tmpfs
+─────────────         ──────────────        ──────────────
+Managed by Docker     You control path      RAM only
+Portable              Host-dependent        Lost on stop
+docker volume create  -v /host:/container   --tmpfs /tmp
+Best for production   Best for dev          Best for secrets/temp
+
+6. Networking Types
+bridge   ← default, containers on same host talk via virtual switch
+host     ← container shares host network stack (no isolation)
+none     ← no networking
+overlay  ← multi-host (Docker Swarm)
+macvlan  ← container gets its own MAC/IP on physical network
+
+7. Multi-Stage Build
+# Stage 1: Build (heavy — compiler, dev deps)
+FROM node:20 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Stage 2: Runtime (minimal — only what runs)
+FROM node:20-alpine AS runtime
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+USER node
+CMD ["node", "dist/index.js"]
+
+# Result: production image has NO compiler, NO dev tools, NO source
+
+8. Docker Compose
+services:
+  app:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+    volumes: [appdata:/data]
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      retries: 5
+    volumes: [dbdata:/var/lib/postgresql/data]
+    networks: [backend]
+
+volumes:
+  appdata:
+  dbdata:
+
+networks:
+  backend:
+
+9. Security Summary
+❌ Running as root          → USER appuser / USER 10001
+❌ Secrets in ENV/ARG       → --mount=type=secret / runtime -e
+❌ Unscanned images         → trivy image --severity HIGH,CRITICAL
+❌ Writable filesystem      → --read-only --tmpfs /tmp
+❌ All capabilities          → --cap-drop ALL --cap-add <only needed>
+❌ Shell form ENTRYPOINT    → ["exec", "form"] for PID 1 signals
+
+10. Health Check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
+
+docker inspect <container> | grep -A5 Health
+# "Status": "healthy" / "unhealthy" / "starting"
+
+docker ps   # shows (healthy) or (unhealthy) in STATUS column
+
+20 Interview Questions
+Q1: What is the difference between an image and a container?
+
+An image is a read-only template (blueprint). A container is a running instance of that image — it adds a thin writable layer on top. Multiple containers can run from the same image simultaneously.
+
+Q2: What happens when you run docker build?
+
+Docker reads the Dockerfile top-to-bottom, executes each instruction as a separate layer, caches each layer by its content hash. If an instruction changes, that layer and all subsequent layers are rebuilt. The final result is a tagged image stored locally.
+
+Q3: What is a Docker layer and why does layer caching matter?
+
+Each RUN, COPY, ADD creates an immutable layer. Layers are cached by content. If you change COPY app.py, Docker replays from that point — not from the start. Best practice: put frequently changing instructions (COPY code) at the bottom, rarely changing ones (install dependencies) at the top to maximize cache hits.
+
+Q4: What is the difference between COPY and ADD?
+
+Both copy files into the image. ADD additionally:
+
+Auto-extracts .tar archives
+Accepts remote URLs
+Use COPY by default — it is explicit and predictable. Use ADD only when you specifically need tar-extraction.
+
+Q5: What is the difference between CMD and ENTRYPOINT?
+
+ENTRYPOINT defines the fixed executable that always runs. CMD provides default arguments to it, easily overridden at docker run. Combined: ENTRYPOINT ["python"] + CMD ["app.py"] → runs python app.py by default, but docker run myimage other.py runs python other.py.
+
+Q6: What is exec form vs shell form and why does it matter?
+
+Exec form ["python", "app.py"] — runs directly, process is PID 1, receives SIGTERM → graceful shutdown works
+Shell form python app.py — runs as /bin/sh -c python app.py, sh is PID 1, your app never gets SIGTERM → docker stop waits 10s then kills forcefully
+Q7: What is the difference between ARG and ENV?
+
+ARG is available only during the build (docker build --build-arg). It is gone at runtime. ENV is set at build time and persists into the running container. To make a build value available at runtime: ARG VER=1.0 then ENV VERSION=$VER.
+
+Q8: What is a multi-stage build and why use it?
+
+A Dockerfile with multiple FROM instructions. Each stage is independent. You copy only the compiled artifacts from the builder stage into the final minimal image. Benefits: smaller production image (no compiler/dev tools), smaller attack surface, faster pulls.
+
+Q9: What is the difference between a named volume and a bind mount?
+
+Named volume — managed by Docker, stored in Docker's storage area, portable across systems, best for production data. Bind mount — maps a specific host path (-v /home/user/data:/data), host-dependent, best for development (live code editing).
+
+Q10: How do containers communicate on the same Docker network?
+
+Containers on the same bridge network can reach each other by container name as DNS hostname. Example: a web container reaches a db container at db:5432 if both are on the same network. Docker's embedded DNS resolves container names automatically.
+
+Q11: What is EXPOSE in a Dockerfile?
+
+EXPOSE 3000 is documentation only — it tells humans and tools which port the app listens on. It does NOT publish the port. To actually publish: docker run -p 8080:3000 maps host port 8080 to container port 3000.
+
+Q12: What is the difference between docker stop and docker kill?
+
+docker stop sends SIGTERM (graceful shutdown), waits 10 seconds, then sends SIGKILL. docker kill sends SIGKILL immediately (no grace period). Always prefer docker stop to allow the app to flush buffers, close DB connections, etc.
+
+Q13: What is a distroless image?
+
+An image with no OS shell, no package manager, no bash — only your app and its runtime. Produced by Google (gcr.io/distroless). Benefit: smallest possible attack surface — an attacker who breaks in has no tools to use. Drawback: very hard to debug interactively.
+
+Q14: How does Trivy work and what does it scan?
+
+Trivy scans the contents of an image's layers, extracts installed packages (OS + language), and cross-references them against CVE databases (NVD, GitHub Advisory). It also scans for secrets (API keys, tokens) and misconfigurations. --exit-code 1 --severity CRITICAL fails CI on critical findings.
+
+Q15: Why should you never put secrets in ENV or ARG in a Dockerfile?
+
+ENV values are visible in docker inspect and in the image manifest. ARG values are stored in the build cache and visible in docker history. Use BuildKit --mount=type=secret for build-time secrets, and runtime -e or mounted secret files for runtime secrets.
+
+Q16: What is docker-compose depends_on and what is its limitation?
+
+depends_on controls start order — it waits for the dependency container to start, NOT for it to be ready/healthy. A DB container starting is not the same as Postgres accepting connections. Use depends_on: condition: service_healthy combined with a healthcheck on the dependency to wait until it's actually ready.
+
+Q17: What is the difference between docker-compose up and docker-compose up --build?
+
+up starts containers using existing images (builds only if image doesn't exist yet). up --build always rebuilds images before starting. Use --build when you've changed the Dockerfile or source code and want the changes applied.
+
+Q18: What is --read-only and --cap-drop ALL?
+
+--read-only makes the container's root filesystem immutable — no files can be written (pair with --tmpfs /tmp for temp writes). --cap-drop ALL removes all Linux kernel capabilities from the container — prevents network config changes, ptrace debugging of other processes, etc. Add back only what's needed with --cap-add.
+
+Q19: What is the HEALTHCHECK instruction and when is a container marked unhealthy?
+
+HEALTHCHECK CMD curl -f http://localhost/health || exit 1 runs the command periodically. After --retries consecutive failures, the container is marked unhealthy. Docker doesn't automatically restart unhealthy containers — but orchestrators like Swarm and Kubernetes do. docker ps shows (unhealthy) in the STATUS column.
+
+Q20: A container exits immediately after docker run. How do you debug it?
+# See exit code and status
+docker ps -a
+
+# Check logs (even from stopped container)
+docker logs <container_id>
+
+# Override CMD to get a shell
+docker run -it --entrypoint sh <image>
+
+# Inspect the image to see what CMD/ENTRYPOINT was set
+docker inspect <image> | grep -A5 Cmd
+
+Common causes: app crashes on start, missing env var, missing file, wrong WORKDIR, permission denied (non-root user can't read files).> # See exit code and status
+docker ps -a
+
+Check logs (even from stopped container)
+docker logs <container_id>
+
+Override CMD to get a shell
+docker run -it --entrypoint sh <image>
+
+Inspect the image to see what CMD/ENTRYPOINT was set
+docker inspect <image> | grep -A5 Cmd
+Common causes: app crashes on start, missing env var, missing file, wrong `WORKDIR`, permission denied (non-root user can't read files).
