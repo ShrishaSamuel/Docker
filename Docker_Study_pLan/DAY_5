@@ -1,0 +1,213 @@
+Multi-Stage Docker Builds — Java/Node App
+What & Why
+Multi-stage builds use multiple FROM statements in one Dockerfile. Early stages compile/build; the final stage copies only the artifacts — keeping the production image small and secure.
+
+Step-by-Step Hands-On Practice
+Step 1 — Create the Project Structure
+Run these commands to scaffold the project:
+
+mkdir multi-stage-demo && cd multi-stage-demo
+mkdir -p backend frontend
+
+Step 2 — Create a Simple Java Backend (Spring Boot style)
+<br>
+
+backend/App.java (minimal, no framework needed for demo):public class App {
+    public static void main(String[] args) throws Exception {
+        var server = com.sun.net.httpserver.HttpServer.create(
+            new java.net.InetSocketAddress(8080), 0);
+        server.createContext("/api", exchange -> {
+            String response = "{\"message\": \"Hello from Java!\"}";
+            exchange.sendResponseHeaders(200, response.length());
+            exchange.getResponseBody().write(response.getBytes());
+            exchange.getResponseBody().close();
+        });
+        server.start();
+        System.out.println("Server started on port 8080");
+    }
+}
+
+backend/build.sh:
+javac App.java -d out/
+jar cfe app.jar App -C out/ .
+
+Step 3 — Create a Simple Node.js Frontend
+frontend/package.json:
+{
+  "name": "frontend",
+  "version": "1.0.0",
+  "scripts": { "build": "echo 'Building...' && mkdir -p dist && cp index.html dist/" },
+  "devDependencies": {}
+}
+
+frontend/index.html:
+  <!DOCTYPE html>
+<html>
+  <body>
+    <h1>Multi-Stage Demo</h1>
+    <script>
+      fetch('/api').then(r => r.json()).then(d => document.body.innerHTML += `<p>${d.message}</p>`);
+    </script>
+  </body>
+</html>
+
+Step 4 — Write the Multi-Stage Dockerfile
+Dockerfile (this is the core of the exercise):
+# ─── Stage 1: Build Java Backend ─────────────────────────────────────────────
+FROM eclipse-temurin:21-jdk AS java-builder
+
+WORKDIR /app/backend
+COPY backend/App.java .
+
+# Compile and package
+RUN mkdir -p out && \
+    javac App.java -d out/ && \
+    jar cfe app.jar App -C out/ .
+
+# ─── Stage 2: Build Node.js Frontend ─────────────────────────────────────────
+FROM node:20-alpine AS node-builder
+
+WORKDIR /app/frontend
+COPY frontend/package.json .
+
+RUN npm install
+
+COPY frontend/ .
+RUN npm run build
+
+# ─── Stage 3: Final Lean Production Image ─────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine AS production
+
+WORKDIR /app
+
+# Copy ONLY the built artifacts from previous stages
+COPY --from=java-builder  /app/backend/app.jar    ./app.jar
+COPY --from=node-builder  /app/frontend/dist/      ./static/
+
+EXPOSE 8080
+
+# Non-root user for security
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+Step 5 — Build and Compare Image Sizes
+# Build the multi-stage image
+docker build -t multi-stage-demo:latest .
+
+# Compare sizes — notice the difference!
+docker images | grep multi-stage-demo
+
+# Build a naive single-stage for comparison
+docker build --target java-builder -t naive-build:latest .
+docker images | grep -E "multi-stage|naive-build"
+
+Step 6 — Run and Test
+docker run -d -p 8080:8080 --name demo multi-stage-demo:latest
+curl http://localhost:8080/api
+# Expected: {"message": "Hello from Java!"}
+
+# Inspect what's inside the final image (no JDK, no node_modules!)
+docker run --rm multi-stage-demo:latest sh -c "ls /app && java -version"
+
+Step 7 — Advanced: Target a Specific Stage (for local dev)
+# Run only the node-builder stage for frontend debugging
+docker build --target node-builder -t frontend-dev:latest .
+docker run --rm frontend-dev:latest ls /app/frontend/dist
+
+Step 8 — Use BuildKit Cache Mounts (optimization)
+# Replace the npm install line with:
+RUN --mount=type=cache,target=/root/.npm \
+    npm install
+
+# Enable BuildKit
+DOCKER_BUILDKIT=1 docker build -t multi-stage-demo:latest .
+# Second build will be MUCH faster
+
+Interview Questions & Answers
+Conceptual
+Q1: What is a multi-stage build and why use it?
+
+Multiple FROM instructions in one Dockerfile. Each stage can be named. Final stage copies only required artifacts. Benefits: smaller images, no build tools in production, better security posture.
+
+Q2: What is the size difference you'd typically see?
+
+A JDK image (500MB) + Node.js (350MB) single-stage vs a JRE-alpine final stage (~85MB). Easily 5-10x smaller in practice.
+
+Q3: Are intermediate stage images cached?
+
+Yes. Docker caches each stage layer independently. The cache is invalidated only when that stage's instructions or their inputs change.
+
+Q4: How do you copy files between stages?
+
+COPY --from=<stage-name-or-index> <src> <dest>. You can also copy from external images: COPY --from=nginx:alpine /etc/nginx/nginx.conf /etc/nginx/.
+
+Q5: What happens to intermediate stages after a build?
+
+They are discarded (not tagged) unless explicitly built with --target. Only final stage layers are in the resulting image.
+
+Practical / Scenario-Based
+Q6: How do you build only a specific stage?
+
+docker build --target <stage-name> .
+
+Q7: Can you run tests in a multi-stage build and fail the build if tests fail?
+
+Yes. Add a test stage after the build stage, run tests there (RUN mvn test), then copy artifacts to final stage only if tests pass.
+FROM maven:3.9 AS test
+RUN mvn test   # Build fails here if tests fail
+
+FROM eclipse-temurin:21-jre AS production
+COPY --from=test /app/target/app.jar .
+Q8: How do you pass build arguments across stages?
+
+ARG is scoped per stage. Re-declare it in each stage that needs it:
+ARG VERSION
+FROM node:20 AS builder
+ARG VERSION          # must re-declare
+RUN echo $VERSION
+
+Q9: What's the difference between ARG and ENV in multi-stage builds?
+
+ARG is build-time only, not available at runtime, scoped per stage. ENV persists into the running container and all subsequent stages.
+
+Q10: How can you speed up multi-stage builds in CI/CD?
+
+Use --cache-from to pull cached layers from a registry
+Use BuildKit with --mount=type=cache for package manager caches
+Use docker buildx with inline cache: --build-arg BUILDKIT_INLINE_CACHE=1
+
+Security-Focused
+Q11: Why should the final stage use a non-root user?
+
+If the container is compromised, the attacker has limited privileges. Use adduser + USER directive before ENTRYPOINT.
+
+Q12: Why use -alpine or -slim base images in the final stage?
+
+Smaller attack surface — fewer installed packages means fewer CVEs. Alpine uses musl libc and busybox, resulting in ~5MB base vs ~100MB Debian.
+
+Q13: How do you ensure no secrets (API keys, build credentials) leak into the final image?
+
+Use --mount=type=secret (BuildKit) instead of ENV or ARG for secrets
+Secrets passed as ARG are visible in docker history — avoid this
+Multi-stage naturally prevents build-time credentials from appearing in final stage layers
+
+Debugging
+Q14: How do you debug a failed intermediate stage?
+
+Build up to that stage: docker build --target <failing-stage> . then docker run -it <image> sh
+
+Q15: COPY --from fails with "stage not found" — why?
+
+The stage name in FROM ... AS <name> must exactly match the name in --from=<name>. Names are case-insensitive but must exist in the same Dockerfile.
+
+Quick Reference Cheatsheet
+Concept	Command/Syntax
+Name a stage	FROM image AS stagename
+Copy from stage	COPY --from=stagename /src /dest
+Copy from external image	COPY --from=nginx:alpine /etc/nginx .
+Build specific stage	docker build --target stagename .
+Enable BuildKit	DOCKER_BUILDKIT=1 docker build .
+Cache mount	RUN --mount=type=cache,target=/root/.m2 mvn package
+Secret mount	RUN --mount=type=secret,id=mysecret cat /run/secrets/mysecret  
