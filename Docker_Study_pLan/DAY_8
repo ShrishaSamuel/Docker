@@ -1,0 +1,357 @@
+Docker Compose Basics — Services, Ports, Env
+What Docker Compose Does
+Compose lets you define and run multi-container applications in a single YAML file. One docker compose up replaces dozens of docker run commands — with networking, volumes, and dependencies wired automatically.
+
+Step-by-Step Hands-On Practice
+Step 1 — Project Structure
+mkdir compose-demo && cd compose-demo
+mkdir -p app
+
+File layout you'll build:
+compose-demo/
+├── docker-compose.yml
+├── docker-compose.override.yml   # dev overrides
+├── .env                          # environment variables
+└── app/
+    ├── Dockerfile
+    └── index.js
+
+Step 2 — Write the Node.js App
+app/index.js:
+const http = require('http');
+const { Client } = require('pg');
+
+const client = new Client({
+  host:     process.env.DB_HOST,
+  port:     process.env.DB_PORT     || 5432,
+  user:     process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+});
+
+client.connect().then(() =>
+  client.query('CREATE TABLE IF NOT EXISTS visits (id SERIAL, ts TIMESTAMPTZ DEFAULT NOW())')
+);
+
+http.createServer(async (req, res) => {
+  await client.query('INSERT INTO visits DEFAULT VALUES');
+  const { rows } = await client.query('SELECT COUNT(*) FROM visits');
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ visits: rows[0].count }));
+}).listen(3000, () => console.log('App running on port 3000'));
+
+app/Dockerfile:
+FROM node:20-alpine
+WORKDIR /app
+RUN npm init -y && npm install pg
+COPY index.js .
+EXPOSE 3000
+CMD ["node", "index.js"]
+
+Step 3 — Environment File
+.env (never commit secrets — use this as a pattern):
+# App
+APP_PORT=3000
+NODE_ENV=development
+
+# Database
+POSTGRES_USER=appuser
+POSTGRES_PASSWORD=supersecret
+POSTGRES_DB=appdb
+POSTGRES_PORT=5432
+
+Step 4 — Core docker-compose.yml
+version: "3.9"
+
+# ── Named volumes (persists data) ─────────────────────────────────────────────
+volumes:
+  pgdata:
+  pgadmin-data:
+
+# ── Custom network (containers talk by service name) ──────────────────────────
+networks:
+  app-net:
+    driver: bridge
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── 1. PostgreSQL Database ──────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}        # from .env
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # persist DB files
+    ports:
+      - "${POSTGRES_PORT}:5432"                  # expose to host for tools
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 2. Node.js Application ──────────────────────────────────────────────────
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV:     ${NODE_ENV}
+      DB_HOST:      db                           # service name = hostname
+      DB_PORT:      5432
+      DB_USER:      ${POSTGRES_USER}
+      DB_PASSWORD:  ${POSTGRES_PASSWORD}
+      DB_NAME:      ${POSTGRES_DB}
+    ports:
+      - "${APP_PORT}:3000"                       # host:container
+    networks:
+      - app-net
+    depends_on:
+      db:
+        condition: service_healthy               # wait for DB healthcheck ✓
+
+  # ── 3. pgAdmin (optional UI for DB inspection) ─────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@demo.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    networks:
+      - app-net
+    depends_on:
+      - db
+    profiles:
+      - tools                                    # only starts with --profile tools
+
+Step 5 — Dev Override File
+docker-compose.override.yml (auto-merged in dev, ignored in prod):
+# Overrides applied automatically when running `docker compose up` locally
+version: "3.9"
+
+services:
+  app:
+    build:
+      target: development                        # if using multi-stage
+    volumes:
+      - ./app:/app                               # live code reload
+      - /app/node_modules                        # preserve container's node_modules
+    environment:
+      NODE_ENV: development
+      DEBUG: "*"
+    command: npx nodemon index.js                # hot-reload in dev
+
+  db:
+    ports:
+      - "5432:5432"                              # expose DB port locally in dev only
+
+Step 6 — Run and Test
+# Start all services (builds app image automatically)
+docker compose up -d
+
+# Watch logs for all services
+docker compose logs -f
+
+# Watch logs for one service
+docker compose logs -f app
+
+# Check service status
+docker compose ps
+
+# Test the app
+curl http://localhost:3000
+# {"visits":"1"}
+curl http://localhost:3000
+# {"visits":"2"}
+
+# Start with the tools profile (pgAdmin)
+docker compose --profile tools up -d pgadmin
+# Visit http://localhost:5050
+
+Step 7 — Exec, Scale, and Restart
+# Run a command inside a running service
+docker compose exec db psql -U appuser -d appdb -c "SELECT * FROM visits;"
+
+# Open an interactive shell
+docker compose exec app sh
+
+# Restart a single service (e.g., after config change)
+docker compose restart app
+
+# Scale a stateless service to 3 replicas
+docker compose up -d --scale app=3
+# Note: remove the fixed port mapping first, or use a load balancer
+
+Step 8 — Lifecycle Commands
+# Build images without starting
+docker compose build
+
+# Build with no cache (force fresh)
+docker compose build --no-cache
+
+# Pull latest base images
+docker compose pull
+
+# Stop containers, keep volumes and networks
+docker compose stop
+
+# Stop AND remove containers + networks (volumes survive)
+docker compose down
+
+# Stop AND remove everything including volumes (DATA LOSS)
+docker compose down -v
+
+# View rendered config (with .env substituted)
+docker compose config
+
+Step 9 — Production Compose File Pattern
+docker-compose.prod.yml:
+version: "3.9"
+
+services:
+  app:
+    image: myregistry/myapp:${IMAGE_TAG:-latest}  # pre-built image, not build:
+    restart: always
+    environment:
+      NODE_ENV: production
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    restart: always
+    ports: []                                      # no host exposure in prod
+
+# Run with both files merged (prod overrides base)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+Step 10 — Environment Variable Precedence (important!)
+Highest priority
+    │  1. docker compose run -e KEY=val      (inline flag)
+    │  2. Shell environment variable          (export KEY=val)
+    │  3. docker-compose.override.yml
+    │  4. docker-compose.yml  environment:
+    │  5. .env file
+    ▼  6. Dockerfile ENV instruction
+Lowest priority
+
+# Override a single variable at runtime
+APP_PORT=9090 docker compose up -d
+
+# Pass current shell env to container
+export NODE_ENV=staging
+docker compose up -d   # NODE_ENV=staging used if not set in compose file
+
+Interview Questions & Answers
+Conceptual
+Q1: What problem does Docker Compose solve vs plain docker run?
+
+docker run is a single-container command. Compose declaratively defines multi-container apps — services, networks, volumes — in one file. Reproducible, version-controlled, one command to start everything.
+
+Q2: What is the difference between ports and expose in Compose?
+
+ports maps host port → container port, making the service reachable from outside the Docker host. expose only documents/opens the port on the container's internal network — other containers on the same network can reach it, but the host cannot.
+
+Q3: What does depends_on guarantee?
+
+It controls start order only. With condition: service_started (default), Docker just starts the dependency first. With condition: service_healthy, it waits until the healthcheck passes. It does NOT guarantee the app inside is ready — always add healthchecks.
+
+Q4: What is the difference between environment: and env_file: in Compose?
+
+environment: sets variables inline in the YAML (visible in docker compose config, risky for secrets). env_file: reads from an external file — cleaner separation of config and code, file not committed to git.
+
+Q5: What does restart: unless-stopped mean?
+
+Container restarts automatically on crash or system reboot, but NOT if you manually docker compose stop it. Options: no (default), always, on-failure, unless-stopped.
+
+Practical / Scenario-Based
+Q6: App starts before DB is ready and crashes. How do you fix it?
+
+Add a healthcheck to the DB service and set depends_on with condition: service_healthy. Also implement retry logic in the app (exponential backoff) — depends_on is a Docker-level guarantee, not an app-level one.
+
+Q7: How do you use different configs for dev and prod without duplicating YAML?
+
+Base docker-compose.yml holds shared config. docker-compose.override.yml auto-applied in dev. For prod: docker compose -f docker-compose.yml -f docker-compose.prod.yml up. Each file only overrides what it needs.
+
+Q8: How do two services communicate in Compose?
+
+Compose creates a default network for the project. Services reach each other by service name as the hostname. app can connect to db:5432 because both are on the same Compose network.
+
+Q9: How do you pass secrets securely in Compose?
+
+Use Docker Secrets (secrets: key in Compose, requires Swarm) or mount a secrets file via volume. Never hardcode passwords in environment: in production — use a secrets manager (Vault, AWS Secrets Manager) and inject at runtime.
+
+Q10: What is a Compose profile and when would you use it?
+
+Profiles (profiles: [tools]) let you define optional services that are only started when explicitly requested with --profile tools. Use for dev tools (pgAdmin, mailhog, mock services) you don't want running in every environment.
+
+Debugging
+Q11: How do you view what the final merged Compose config looks like?
+
+docker compose config — prints the fully resolved YAML with all .env substitutions applied. Essential for debugging variable substitution issues.
+
+Q12: A service keeps restarting. How do you debug it?
+
+docker compose ps                    # see restart count
+docker compose logs --tail=50 app    # last 50 log lines
+docker compose run --rm app sh       # start fresh instance with shell
+
+Q13: ${VARIABLE} in compose file is showing as empty. Why?
+
+Check: 1) .env file exists in same directory as docker-compose.yml, 2) variable is spelled correctly, 3) run docker compose config to see resolved values, 4) the variable isn't overridden by a shell export.
+
+Quick Reference Cheatsheet
+Task	Command
+Start all services	docker compose up -d
+Start with profile	docker compose --profile tools up -d
+Stop (keep data)	docker compose down
+Stop + delete volumes	docker compose down -v
+View logs	docker compose logs -f [service]
+Service status	docker compose ps
+Shell into service	docker compose exec app sh
+Run one-off command	docker compose run --rm app node -e "..."
+Rebuild image	docker compose build --no-cache app
+Scale service	docker compose up -d --scale app=3
+View resolved config	docker compose config
+Restart one service	docker compose restart app
+
+docker compose logs --tail=50 app # last 50 log lines
+docker compose run --rm app sh # start fresh instance with shell
+```
+
+Q13: ${VARIABLE} in compose file is showing as empty. Why?
+
+Check: 1) .env file exists in same directory as docker-compose.yml, 2) variable is spelled correctly, 3) run docker compose config to see resolved values, 4) the variable isn't overridden by a shell export.
+
+Quick Reference Cheatsheet
+Task	Command
+Start all services	docker compose up -d
+Start with profile	docker compose --profile tools up -d
+Stop (keep data)	docker compose down
+Stop + delete volumes	docker compose down -v
+View logs	docker compose logs -f [service]
+Service status	docker compose ps
+Shell into service	docker compose exec app sh
+Run one-off command	docker compose run --rm app node -e "..."
+Rebuild image	docker compose build --no-cache app
+Scale service	docker compose up -d --scale app=3
+View resolved config	docker compose config
+Restart one service	docker compose restart app
