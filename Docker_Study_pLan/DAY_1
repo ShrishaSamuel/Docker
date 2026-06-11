@@ -1,0 +1,236 @@
+Docker Overview
+What is Docker?
+Docker is a platform for packaging and running applications in containers — isolated, lightweight processes that bundle an app with all its dependencies.
+
+Containers vs VMs
+Feature	Container	VM
+Isolation	Process-level (shares OS kernel)	Full OS isolation
+Size	MBs	GBs
+Startup	Milliseconds	Seconds–minutes
+Overhead	Very low	High
+Portability	High	Moderate
+
+┌─────────────────────┐    ┌─────────────────────┐
+│  App A  │  App B    │    │  App A   │  App B    │
+│ [Libs]  │ [Libs]    │    │ Guest OS │ Guest OS  │
+├─────────┴───────────┤    ├──────────┴───────────┤
+│    Docker Engine    │    │     Hypervisor        │
+├─────────────────────┤    ├───────────────────────┤
+│      Host OS        │    │       Host OS         │
+└─────────────────────┘    └───────────────────────┘
+        Containers                   VMs
+
+Install Docker (Linux)
+# Install via convenience script
+curl -fsSL https://get.docker.com | sh
+
+# Add your user to the docker group (avoid sudo)
+sudo usermod -aG docker $USER
+newgrp docker
+
+Key Commands
+# Pull and run the hello-world image
+docker run hello-world
+
+# List running containers
+docker ps
+
+# List ALL containers (including stopped)
+docker ps -a
+
+# List downloaded images
+docker images
+
+Sample output of docker ps:
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS   NAMES
+
+Sample output of docker images:
+REPOSITORY    TAG       IMAGE ID       CREATED        SIZE
+hello-world   latest    d2c94e258dcb   13 months ago  13.3kB
+
+Core Concepts
+Image — read-only template (the blueprint)
+Container — a running instance of an image
+Registry — image storage hub (e.g., Docker Hub at hub.docker.com)
+Dockerfile — script to build a custom image
+
+Docker Hands-On Practice — Step by Step
+Phase 1: Setup & First Container
+# 1. Verify installation
+docker --version
+docker info
+
+# 2. Run hello-world
+docker run hello-world
+
+# 3. Observe what happened — Docker pulled image, created container, ran it, exited
+docker ps -a          # see the stopped hello-world container
+docker images         # see the hello-world image cached locally
+
+Phase 2: Interactive Containers
+# 4. Run Ubuntu interactively
+docker run -it ubuntu bash
+
+# Inside the container:
+whoami                # root
+hostname              # container ID
+ls /
+cat /etc/os-release
+exit
+
+# 5. Back on host — container is stopped
+docker ps -a
+
+Phase 3: Container Lifecycle
+# 6. Run a named container in background (detached)
+docker run -d --name mybox alpine sleep 300
+
+# 7. Check it's running
+docker ps
+
+# 8. Execute a command inside running container
+docker exec -it mybox sh
+ls
+exit
+
+# 9. Stop, start, remove
+docker stop mybox
+docker start mybox
+docker rm -f mybox
+
+Phase 4: Port Mapping
+# 10. Run nginx web server, map host:8080 → container:80
+docker run -d --name webserver -p 8080:80 nginx
+
+# 11. Test it
+curl http://localhost:8080
+# or open browser at localhost:8080
+
+docker logs webserver        # view logs
+docker stop webserver
+docker rm webserver
+
+Phase 5: Volume (Persist Data)
+# 12. Run nginx with a custom HTML page via bind mount
+mkdir ~/mysite
+echo "<h1>Hello from Docker!</h1>" > ~/mysite/index.html
+
+docker run -d --name mysite \
+  -p 8080:80 \
+  -v ~/mysite:/usr/share/nginx/html \
+  nginx
+
+curl http://localhost:8080   # see your custom page
+
+# Edit the file on host — change reflects immediately in container
+echo "<h1>Updated!</h1>" > ~/mysite/index.html
+curl http://localhost:8080
+
+Phase 6: Build Your Own Image
+# 13. Create a Dockerfile
+mkdir ~/myapp && cd ~/myapp
+cat > Dockerfile <<EOF
+FROM python:3.11-slim
+WORKDIR /app
+COPY app.py .
+CMD ["python", "app.py"]
+EOF
+
+cat > app.py <<EOF
+print("Hello from my Docker image!")
+EOF
+
+# 14. Build and run
+docker build -t myapp:v1 .
+docker run myapp:v1
+
+# 15. Inspect image layers
+docker history myapp:v1
+docker inspect myapp:v1
+
+Phase 7: Cleanup
+# Remove stopped containers
+docker container prune
+
+# Remove unused images
+docker image prune
+
+# Remove everything unused
+docker system prune -a
+
+# Remove everything unused
+docker system prune -aInterview Questions & Answers
+Conceptual
+Q1. What is Docker and why is it used?
+
+Docker packages apps + dependencies into containers ensuring "works on my machine" = works everywhere. Used for consistent dev/test/prod environments, microservices, CI/CD.
+
+Q2. Difference between Container and VM?
+
+Containers share the host OS kernel, are lightweight (MBs, ms startup). VMs have a full guest OS, are heavy (GBs, minutes startup). Containers are not full isolation — they share kernel.
+
+Q3. What is a Docker Image vs Container?
+
+Image = read-only blueprint (like a class). Container = running instance of an image (like an object). Multiple containers can run from one image.
+
+Q4. What is a Dockerfile?
+
+A text script with instructions (FROM, RUN, COPY, CMD, etc.) to build a Docker image layer by layer.
+
+Q5. What is Docker Hub?
+
+A public registry to store and share Docker images. Like GitHub but for images.
+
+Command-Based
+Q6. How do you see only running containers?
+
+docker ps
+
+Q7. How do you see all containers including stopped?
+
+docker ps -a
+
+Q8. How do you run a container in background?
+
+docker run -d image_name
+
+Q9. How do you get a shell inside a running container?
+
+docker exec -it <container_id> bash
+
+Q10. How do you map port 8080 on host to 80 in container?
+
+docker run -p 8080:80 nginx
+
+Q11. Difference between docker stop and docker kill?
+
+stop sends SIGTERM (graceful shutdown). kill sends SIGKILL (immediate termination).
+
+Q12. How do you remove an image?
+
+docker rmi image_name — must stop/remove containers using it first.
+
+Advanced Scenario
+Q13. What happens when you run docker run hello-world?
+
+Docker checks local images — not found
+Pulls hello-world from Docker Hub
+Creates a container from the image
+Runs the container — prints message
+Container exits (status: Exited)
+Q14. What is a dangling image?
+
+An untagged image (<none>:<none>) left behind after rebuilding. Removed with docker image prune.
+
+Q15. How do you persist data beyond a container's life?
+
+Use volumes (docker volume) or bind mounts (-v /host/path:/container/path).
+
+Q16. What is the difference between COPY and ADD in Dockerfile?
+
+COPY copies local files only. ADD can also extract tar files and fetch from URLs — prefer COPY unless you need those extras.
+
+Q17. What does docker system prune do?
+
+Removes all stopped containers, dangling images, unused networks, and build cache.
+
