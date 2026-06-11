@@ -1,0 +1,449 @@
+Docker Compose — Health Checks, depends_on, Override Files
+Why These Three Work Together
+depends_on  ──controls──►  start order
+healthcheck ──reports──►   service readiness
+override    ──controls──►  environment-specific config
+Without healthchecks, depends_on only guarantees the container started, not that the app inside is ready.
+
+Step-by-Step Hands-On Practice
+Step 1 — See the Problem Without Healthchecks
+mkdir healthcheck-demo && cd healthcheck-demo
+
+docker-compose.yml (broken — no healthcheck):
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+
+  app:
+    image: alpine
+    command: sh -c "echo 'Connecting to DB...' && sleep 2 && echo 'Connected!'"
+    depends_on:
+      - db          # only waits for container to START, not for postgres to be READY
+
+docker compose up
+# app starts immediately — postgres isn't ready yet
+# In real apps: "Connection refused" errors
+docker compose down
+
+Step 2 — Add a Healthcheck to the DB Service
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_USER: appuser
+      POSTGRES_DB: appdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 10s      # run check every 10s
+      timeout: 5s        # fail if no response in 5s
+      retries: 5         # mark unhealthy after 5 consecutive failures
+      start_period: 15s  # grace period before first check (startup time)
+
+  app:
+    image: alpine
+    command: sh -c "echo 'DB is ready! Connecting...' && sleep 1 && echo 'Done'"
+    depends_on:
+      db:
+        condition: service_healthy   # waits for healthcheck to pass ✓
+
+docker compose up
+# app waits until postgres healthcheck passes, THEN starts
+docker compose ps    # see health status column
+docker compose down
+
+Step 3 — Healthcheck Conditions Reference
+depends_on:
+  db:
+    condition: service_started    # default: just started (no healthcheck needed)
+  cache:
+    condition: service_healthy    # healthcheck must be passing
+  migrator:
+    condition: service_completed_successfully  # one-shot job must exit 0
+
+Step 4 — Healthchecks for Different Services
+Full docker-compose.yml with multiple service types:
+
+version: "3.9"
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  app-net:
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB:       ${POSTGRES_DB:-appdb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d ${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]   # returns PONG when ready
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ── DB Migration (one-shot job) ─────────────────────────────────────────────
+  migrator:
+    image: alpine
+    command: sh -c "echo 'Running migrations...' && sleep 3 && echo 'Migrations done'"
+    networks:
+      - app-net
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"    # do not restart after exit
+
+  # ── Node.js Application ─────────────────────────────────────────────────────
+  app:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "node -e \"require('http').createServer((_,r)=>{r.end('ok')}).listen(3000)\""
+    ports:
+      - "3000:3000"
+    networks:
+      - app-net
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully  # app starts only after migrations
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Nginx Reverse Proxy ─────────────────────────────────────────────────────
+  proxy:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    networks:
+      - app-net
+    depends_on:
+      app:
+        condition: service_healthy   # only route traffic when app is ready
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+docker compose up
+docker compose ps    # watch health status: starting → healthy
+
+Step 5 — Inspect Health Status
+# See health status in ps output
+docker compose ps
+
+# Full detail on a container's health
+docker inspect healthcheck-demo-db-1 \
+  --format '{{json .State.Health}}' | python3 -m json.tool
+
+# Watch health in real time
+watch -n2 'docker compose ps'
+
+# See each individual health check log entry
+docker inspect healthcheck-demo-db-1 \
+  --format '{{range .State.Health.Log}}{{.Output}}{{end}}'
+
+Step 6 — Override Files: The Pattern
+docker-compose.yml           ← base config (shared across all environments)
+docker-compose.override.yml  ← auto-merged in dev (never used in prod)
+docker-compose.prod.yml      ← explicit prod overrides
+docker-compose.test.yml      ← CI/test overrides
+
+Merge rules:
+
+Lists (like ports, volumes) are concatenated
+Maps (like environment) are merged (override wins on conflict)
+Scalar values (like image, command) are replaced
+
+Step 7 — Write the Override Files
+docker-compose.yml (base — minimal, environment-agnostic):
+version: "3.9"
+
+volumes:
+  pgdata:
+
+networks:
+  app-net:
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: myapp:${IMAGE_TAG:-latest}
+    environment:
+      DB_HOST: db
+      DB_USER: ${POSTGRES_USER}
+      DB_PASS: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+    networks:
+      - app-net
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+docker-compose.override.yml (dev — auto-applied, never commit secrets):
+version: "3.9"
+
+services:
+  db:
+    ports:
+      - "5432:5432"             # expose DB to host for local tools (TablePlus, DBeaver)
+    environment:
+      POSTGRES_PASSWORD: devpassword   # weak password fine locally
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile          # build from source in dev
+    image: myapp:dev
+    volumes:
+      - .:/app                        # live code reload
+      - /app/node_modules             # preserve container node_modules
+    command: npx nodemon src/index.js # hot-reload dev server
+    ports:
+      - "3000:3000"
+      - "9229:9229"                   # Node.js debugger port
+    environment:
+      NODE_ENV: development
+      DEBUG: "app:*"
+    healthcheck:
+      disable: true                   # skip healthcheck in dev (faster iteration)
+
+docker-compose.prod.yml (prod — explicit, used with -f flag):
+version: "3.9"
+
+services:
+  db:
+    restart: always
+    # no ports — DB NOT exposed to host in production
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}   # injected by CI/CD secrets
+
+  app:
+    restart: always
+    image: myregistry/myapp:${IMAGE_TAG}        # pre-built image, no build:
+    environment:
+      NODE_ENV: production
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # prod-only: reverse proxy with SSL termination
+  proxy:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    networks:
+      - app-net
+    depends_on:
+      app:
+        condition: service_healthy
+
+docker-compose.test.yml (CI — ephemeral, no volumes):
+version: "3.9"
+
+services:
+  db:
+    # no volume — use container layer, wiped after test
+    healthcheck:
+      interval: 2s     # faster checks in CI
+      retries: 10
+
+  app:
+    command: npm test
+    environment:
+      NODE_ENV: test
+    depends_on:
+      db:
+        condition: service_healthy
+
+Step 8 — Run Each Environment
+# Dev (auto-merges override.yml)
+docker compose up -d
+
+# Preview what the merged config looks like
+docker compose config
+
+# Production (explicit file merge)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+# CI/Tests
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --abort-on-container-exit
+
+# Verify final resolved YAML for prod
+docker compose -f docker-compose.yml -f docker-compose.prod.yml config
+
+Step 9 — Disable/Override a Healthcheck
+# Disable inherited healthcheck entirely
+healthcheck:
+  disable: true
+
+# Override just the interval (keep the test)
+healthcheck:
+  interval: 30s
+  retries: 10
+
+# Check health from CLI without waiting for interval
+docker inspect --format='{{.State.Health.Status}}' <container>
+
+# Manually trigger a healthcheck test
+docker exec <container> pg_isready -U appuser
+
+Step 10 — COMPOSE_FILE env var (avoid typing -f every time)
+# Set once in your shell profile for prod
+export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+
+# Now plain `docker compose up` uses both files
+docker compose up -d
+
+# Unset to go back to default
+unset COMPOSE_FILE
+
+Interview Questions & Answers
+Health Checks
+Q1: What are the four states of a Docker healthcheck?
+
+starting — container started, within start_period, no result yet
+healthy — last N checks passed
+unhealthy — last retries consecutive checks failed
+none — no healthcheck defined
+Q2: What is start_period and why is it important?
+
+Grace period after container start before failures count toward retries. Critical for slow-starting apps (JVM warmup, DB initialization). Failures during start_period are logged but don't mark the container unhealthy.
+
+Q3: What's wrong with test: ["CMD", "curl", "-f", "http://localhost:3000"]?
+
+curl may not be installed in minimal images (alpine). Use wget -qO- for alpine, or install curl explicitly. Also, the check runs inside the container, so localhost refers to the container, not the host.
+
+Q4: Does an unhealthy container get automatically restarted?
+
+Not by Compose alone — unhealthy just changes the status flag. With restart: on-failure or Swarm/Kubernetes, the orchestrator will act on it. In plain Compose, you need external tooling or a watchdog.
+
+Q5: How do you write a healthcheck directly in a Dockerfile vs Compose?
+
+Dockerfile: HEALTHCHECK --interval=10s --retries=3 CMD curl -f http://localhost/ || exit 1
+Compose healthcheck: key overrides the Dockerfile HEALTHCHECK entirely.
+
+depends_on
+Q6: What are the three condition values for depends_on?
+
+service_started — dependency container has started (default, no healthcheck needed)
+service_healthy — dependency's healthcheck is passing
+service_completed_successfully — dependency exited with code 0 (for migrations, init jobs)
+Q7: depends_on with service_healthy and my app still crashes on startup. Why?
+
+The healthcheck passes at the DB level (socket is open) but the schema/tables aren't ready yet. Solutions: 1) Run migrations as a separate service_completed_successfully dependency. 2) Add retry/backoff logic in the app itself. depends_on is infrastructure-level, not app-logic-level.
+
+Q8: Can you have a chain of depends_on?
+
+Yes: proxy → app (healthy) → migrator (completed) → db (healthy). Compose resolves the full DAG and starts services in correct order.
+
+Override Files
+Q9: What is the difference between -f and --env-file?
+
+-f specifies a Compose YAML file to merge. --env-file specifies a .env-format file for variable substitution inside the YAML. They are independent: -f docker-compose.prod.yml --env-file .env.prod.
+
+Q10: Why should docker-compose.override.yml be in .gitignore?
+
+It often contains developer-specific settings (local paths, weak passwords, debug ports) that differ per machine. Committing it causes merge conflicts and may leak local secrets. Commit a docker-compose.override.yml.example template instead.
+
+Q11: How does list merging work in override files?
+
+Lists like ports and volumes are appended (not replaced). If base has ports: ["3000:3000"] and override adds ports: ["9229:9229"], the result is both ports. For environment (a map), override keys replace base keys with the same name.
+
+Q12: In what order are multiple -f files merged?
+
+Left to right — later files win on conflicts. docker compose -f base.yml -f prod.yml: prod.yml values override base.yml values. The first -f is the base; subsequent files are patches.
+
+Debugging
+Q13: How do you debug why a service stays unhealthy?
+# See health log with output of each check run
+docker inspect <container> \
+  --format '{{range .State.Health.Log}}Exit:{{.ExitCode}} Out:{{.Output}}{{"\n"}}{{end}}'
+
+# Run the healthcheck command manually
+docker exec <container> pg_isready -U appuser
+
+Q14: How do you temporarily disable a healthcheck without editing the file?
+
+Override in docker-compose.override.yml with healthcheck: { disable: true }, or run a specific service with docker compose run --no-healthcheck app.
+
+Quick Reference Cheatsheet
+Task	Command / Config
+Run healthcheck test	test: ["CMD-SHELL", "pg_isready -U user"]
+Disable healthcheck	healthcheck: { disable: true }
+Wait for healthy	depends_on: { db: { condition: service_healthy } }
+Wait for job done	depends_on: { migrator: { condition: service_completed_successfully } }
+Check health status	docker inspect --format='{{.State.Health.Status}}' <c>
+See health logs	docker inspect --format='{{json .State.Health}}' <c>
+Dev (auto override)	docker compose up
+Prod (explicit)	docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+Preview merged YAML	docker compose config
+Set default files	export COMPOSE_FILE=base.yml:prod.yml
